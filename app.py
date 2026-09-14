@@ -2,521 +2,655 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import datetime
 import io
-import os
-import time
+import datetime
+import yfinance as yf
 
-st.set_page_config(page_title="台股策略選股雷達 - 旗艦版", layout="wide")
-
-st.title("🎯 台股自訂策略選股雷達 (旗艦多策略版)")
-st.caption("涵蓋三大核心技術面、投信籌碼面、共振指標與波段出場避險訊號 ｜ 全樣本滾動回測 ｜ 產業族群分類")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-}
-
-CACHE_DIR = "cache_data"
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-# ----------------- 官方產業代碼對照表 -----------------
-TWSE_INDUSTRY_CODES = {
-    "01": "水泥工業", "1": "水泥工業", "02": "食品工業", "2": "食品工業",
-    "03": "塑膠工業", "3": "塑膠工業", "04": "紡織纖維", "4": "紡織纖維",
-    "05": "電機機械", "5": "電機機械", "06": "電器電纜", "6": "電器電纜",
-    "07": "化學生技醫療", "7": "化學生技醫療", "08": "玻璃陶瓷", "8": "玻璃陶瓷",
-    "09": "造紙工業", "9": "造紙工業", "10": "鋼鐵工業", "11": "橡膠工業",
-    "12": "汽車工業", "13": "電子工業", "14": "建材營造業", "15": "航運業",
-    "16": "觀光餐旅業", "17": "金融保險業", "18": "貿易百貨業", "19": "綜合",
-    "20": "其他業", "21": "化學工業", "22": "生技醫療業", "23": "油電燃氣業",
-    "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業", "27": "通信網路業",
-    "28": "電子零組件業", "29": "電子通路業", "30": "資訊服務業", "31": "其他電子業",
-    "32": "綠能環保業", "33": "數位雲端業", "34": "運動休閒業", "35": "居家生活業"
-}
-
-PREFIX_FALLBACK = {
-    "11": "水泥工業", "12": "食品工業", "13": "塑膠工業", "14": "紡織纖維",
-    "15": "電機機械", "16": "電器電纜", "17": "化學工業", "18": "玻璃陶瓷",
-    "19": "造紙工業", "20": "鋼鐵工業", "21": "橡膠工業", "22": "汽車工業",
-    "23": "半導體業", "24": "半導體業", "25": "建材營造業", "26": "航運業",
-    "27": "觀光餐旅業", "28": "金融保險業", "29": "貿易百貨業", "30": "電腦及週邊設備業",
-    "31": "電子零組件業", "32": "資訊服務業", "33": "電子零組件業", "34": "光電業",
-    "35": "光電業", "36": "電子零組件業", "41": "生技醫療業", "47": "化學工業",
-    "49": "通信網路業", "52": "半導體業", "53": "電子通路業", "54": "通信網路業",
-    "55": "建材營造業", "61": "電子零組件業", "62": "電子零組件業", "64": "半導體業",
-    "65": "生技醫療業", "66": "綠能環保業", "67": "生技醫療業", "68": "綠能環保業",
-    "80": "半導體業", "81": "半導體業", "82": "數位雲端業", "83": "綠能環保業",
-    "84": "運動休閒業", "89": "其他電子業", "99": "其他業"
-}
-
-@st.cache_data(ttl=86400 * 30)
-def get_industry_mapping():
-    cache_path = os.path.join(CACHE_DIR, "stock_industries_resolved.csv")
-    if os.path.exists(cache_path):
-        try:
-            df = pd.read_csv(cache_path, dtype={"code": str, "industry": str})
-            return df.set_index("code")["industry"].to_dict()
-        except Exception:
-            pass
-
-    ind_dict = {}
-    try:
-        r = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", headers=HEADERS, timeout=8)
-        if r.status_code == 200:
-            for item in r.json():
-                c = str(item.get("公司代號", "")).strip()
-                raw_ind = str(item.get("產業別", "")).strip()
-                ind_dict[c] = TWSE_INDUSTRY_CODES.get(raw_ind, raw_ind)
-    except Exception:
-        pass
-
-    try:
-        r = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", headers=HEADERS, timeout=8)
-        if r.status_code == 200:
-            for item in r.json():
-                c = str(item.get("SecuritiesCompanyCode", "")).strip()
-                raw_ind = str(item.get("Industry", "")).strip()
-                ind_dict[c] = TWSE_INDUSTRY_CODES.get(raw_ind, raw_ind)
-    except Exception:
-        pass
-
-    if ind_dict:
-        pd.DataFrame(list(ind_dict.items()), columns=["code", "industry"]).to_csv(cache_path, index=False)
-    return ind_dict
-
-INDUSTRY_MAP = get_industry_mapping()
-
-def get_stock_industry(code):
-    c = str(code).strip()
-    val = str(INDUSTRY_MAP.get(c, "")).strip()
-    if val in TWSE_INDUSTRY_CODES:
-        return TWSE_INDUSTRY_CODES[val]
-    if val and val not in ["None", "nan", ""] and not val.isdigit():
-        return val
-    return PREFIX_FALLBACK.get(c[:2], "其他電子業")
-
-def is_valid_target(code, name):
-    c = str(code).strip()
-    n = str(name).strip()
-    if c.startswith("00"):
-        if "主動" in n or (len(c) == 5 and c[-1].isalpha()):
-            return True
-        return False
-    return len(c) >= 4
-
-def calc_rr_targets(price, stop_loss_pct):
-    sl = round(price * (1 - stop_loss_pct / 100), 2)
-    tp_1_3 = round(price * (1 + (stop_loss_pct * 3) / 100), 2)
-    tp_1_5 = round(price * (1 + (stop_loss_pct * 5) / 100), 2)
-    return sl, tp_1_3, tp_1_5
-
-# ----------------- 官方數據爬蟲 (硬碟快取保護) -----------------
-def fetch_twse_day(date_str):
-    cache_path = os.path.join(CACHE_DIR, f"twse_{date_str}.csv")
-    if os.path.exists(cache_path):
-        try:
-            df = pd.read_csv(cache_path, dtype={"code": str, "date": str})
-            df["date"] = df["date"].astype(str)
-            return df
-        except Exception:
-            pass
-        
-    url_p = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={date_str}&type=ALLBUT0999"
-    try:
-        res_p = requests.get(url_p, headers=HEADERS, timeout=8)
-        lines = [line for line in res_p.text.split("\n") if len(line.split('",')) > 10]
-        if not lines:
-            return pd.DataFrame()
-        df_p = pd.read_csv(io.StringIO("\n".join(lines)))
-        df_p.columns = [c.replace('"', '').strip() for c in df_p.columns]
-        df_p = df_p[["證券代號", "證券名稱", "成交股數", "收盤價"]].copy()
-        df_p.columns = ["code", "name", "volume", "close"]
-    except Exception:
-        return pd.DataFrame()
-
-    url_f = f"https://www.twse.com.tw/fund/T86?response=csv&date={date_str}&selectType=ALLBUT0999"
-    df_f = pd.DataFrame()
-    try:
-        res_f = requests.get(url_f, headers=HEADERS, timeout=8)
-        lines_f = [line for line in res_f.text.split("\n") if len(line.split('",')) > 5]
-        if lines_f:
-            df_f = pd.read_csv(io.StringIO("\n".join(lines_f)))
-            df_f.columns = [c.replace('"', '').strip() for c in df_f.columns]
-            sitc_cols = [c for c in df_f.columns if "投信" in c and "買賣超" in c]
-            if sitc_cols:
-                df_f = df_f[["證券代號", sitc_cols[0]]].copy()
-                df_f.columns = ["code", "sitc_buy"]
-    except Exception:
-        pass
-
-    if not df_f.empty:
-        df = pd.merge(df_p, df_f, on="code", how="left")
-    else:
-        df = df_p.copy()
-        df["sitc_buy"] = 0
-
-    for col in ["volume", "close", "sitc_buy"]:
-        df[col] = df[col].astype(str).str.replace('"', '').str.replace(',', '').str.replace('--', '').str.strip()
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    df = df[df["close"] > 0]
-    df["code"] = df["code"].astype(str).str.replace('=', '').str.replace('"', '').str.strip()
-    
-    valid_mask = [is_valid_target(c, n) for c, n in zip(df["code"], df["name"])]
-    df = df[valid_mask].copy()
-
-    df["volume"] = df["volume"] // 1000
-    df["sitc_buy"] = df["sitc_buy"] // 1000
-    df["date"] = str(date_str)
-    
-    if not df.empty:
-        df.to_csv(cache_path, index=False)
-    return df
-
-def fetch_tpex_day(date_str):
-    cache_path = os.path.join(CACHE_DIR, f"tpex_{date_str}.csv")
-    if os.path.exists(cache_path):
-        try:
-            df = pd.read_csv(cache_path, dtype={"code": str, "date": str})
-            df["date"] = df["date"].astype(str)
-            return df
-        except Exception:
-            pass
-        
-    year = int(date_str[:4]) - 1911
-    roc_date = f"{year}/{date_str[4:6]}/{date_str[6:]}"
-    
-    url_p = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_download.php?l=zh-tw&d={roc_date}&s=0,asc,0"
-    try:
-        res = requests.get(url_p, headers=HEADERS, timeout=8)
-        lines = [line for line in res.text.split("\n") if len(line.split(",")) > 10]
-        if not lines:
-            return pd.DataFrame()
-        df = pd.read_csv(io.StringIO("\n".join(lines)))
-        df.columns = [c.strip() for c in df.columns]
-        df = df[["證券代號", "名稱", "成交股數", "收盤"]].copy()
-        df.columns = ["code", "name", "volume", "close"]
-    except Exception:
-        return pd.DataFrame()
-
-    url_f = f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_download.php?l=zh-tw&se=EW&t=D&d={roc_date}&s=0,asc"
-    try:
-        res_f = requests.get(url_f, headers=HEADERS, timeout=8)
-        lines_f = [line for line in res_f.text.split("\n") if len(line.split(",")) > 10]
-        if lines_f:
-            df_f = pd.read_csv(io.StringIO("\n".join(lines_f)))
-            df_f.columns = [c.strip() for c in df_f.columns]
-            sitc_col = [c for c in df_f.columns if "投信" in c and "買賣超" in c]
-            if sitc_col:
-                df_f = df_f[["證券代號", sitc_col[0]]].copy()
-                df_f.columns = ["code", "sitc_buy"]
-                df = pd.merge(df, df_f, on="code", how="left")
-            else:
-                df["sitc_buy"] = 0
-        else:
-            df["sitc_buy"] = 0
-    except Exception:
-        df["sitc_buy"] = 0
-
-    for col in ["volume", "close", "sitc_buy"]:
-        df[col] = df[col].astype(str).str.replace(",", "").str.replace("---", "").str.strip()
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    df = df[df["close"] > 0]
-    df["code"] = df["code"].astype(str).strip()
-    
-    valid_mask = [is_valid_target(c, n) for c, n in zip(df["code"], df["name"])]
-    df = df[valid_mask].copy()
-
-    df["volume"] = df["volume"] // 1000
-    df["sitc_buy"] = df["sitc_buy"] // 1000
-    df["date"] = str(date_str)
-    
-    if not df.empty:
-        df.to_csv(cache_path, index=False)
-    return df
-
-def get_market_history(target_date, days_needed=50):
-    all_dfs = []
-    cur = target_date
-    count = 0
-    attempts = 0
-    progress_box = st.status(f"正在載入歷史資料 (目標 {days_needed} 交易日)...", expanded=True)
-    
-    max_lookback = days_needed * 3 + 30
-    while count < days_needed and attempts < max_lookback:
-        attempts += 1
-        if cur.weekday() < 5:
-            d_s = cur.strftime("%Y%m%d")
-            cached = os.path.exists(os.path.join(CACHE_DIR, f"twse_{d_s}.csv"))
-            if not cached:
-                progress_box.write(f"正在下載 {d_s} 盤後數據...")
-            tw = fetch_twse_day(d_s)
-            tp = fetch_tpex_day(d_s)
-            
-            if not tw.empty or not tp.empty:
-                combined = pd.concat([tw, tp], ignore_index=True)
-                all_dfs.append(combined)
-                count += 1
-                if not cached:
-                    time.sleep(0.15)
-        cur -= datetime.timedelta(days=1)
-        
-    if count < 20:
-        progress_box.update(label=f"天數不足：僅取得 {count} 天", state="error")
-        return pd.DataFrame()
-    else:
-        progress_box.update(label=f"歷史資料就緒！(成功載入 {count} 個交易日)", state="complete")
-        total_df = pd.concat(all_dfs, ignore_index=True)
-        total_df["date"] = total_df["date"].astype(str)
-        return total_df
-
-# ----------------- 報酬率區間分類 (每 10% 為一單位) -----------------
-def get_return_tier(ret):
-    if ret >= 30:
-        return "🔥 > +30%"
-    elif ret >= 20:
-        return "🚀 +20% ~ +30%"
-    elif ret >= 10:
-        return "🟢 +10% ~ +20%"
-    elif ret >= 0:
-        return "🌱 0% ~ +10%"
-    elif ret >= -10:
-        return "🔻 -10% ~ 0%"
-    else:
-        return "💀 < -10%"
-
-def render_backtest_with_filters(target_df, title_prefix, is_backtest):
-    if target_df.empty:
-        st.info(f"回測區間內無符合 {title_prefix} 的訊號。")
-        return
-        
-    target_df["產業別"] = target_df["代號"].apply(get_stock_industry)
-    
-    if is_backtest:
-        st.markdown(f"### 📊 {title_prefix} - 全樣本滾動回測 (共觸發 {len(target_df)} 筆訊號)")
-        
-        # 持有期整體統計
-        stats = []
-        for d in range(1, 6):
-            col = f"+{d}日報酬(%)"
-            wins = (target_df[col] > 0).sum()
-            w_rate = (wins / len(target_df)) * 100
-            avg_r = target_df[col].mean()
-            stats.append({
-                "持有天數": f"跟單 {d} 天",
-                "勝率 (%)": f"{round(w_rate, 1)} %",
-                "平均報酬率 (%)": f"{round(avg_r, 2)} %"
-            })
-        st.table(pd.DataFrame(stats))
-        
-        # 產業別族群表現排行榜
-        st.markdown("#### 🏭 產業族群表現排行")
-        ind_summary = []
-        for ind, group in target_df.groupby("產業別"):
-            ind_count = len(group)
-            win_5d = (group["+5日報酬(%)"] > 0).sum()
-            win_rate_5d = (win_5d / ind_count) * 100
-            avg_ret_5d = group["+5日報酬(%)"].mean()
-            ind_summary.append({
-                "產業類別": ind,
-                "觸發次數": ind_count,
-                "+5日勝率 (%)": f"{round(win_rate_5d, 1)} %",
-                "+5日平均報酬 (%)": round(avg_ret_5d, 2)
-            })
-        ind_df = pd.DataFrame(ind_summary).sort_values(by="觸發次數", ascending=False)
-        st.dataframe(ind_df, use_container_width=True)
-        
-        # 雙下拉篩選器
-        st.markdown("---")
-        st.subheader("🔍 精準條件過濾")
-        col_ind, col_ret = st.columns(2)
-        
-        with col_ind:
-            all_industries = ["全部產業"] + sorted(list(target_df["產業別"].unique()))
-            selected_ind = st.selectbox(f"選擇產業別", all_industries, key=f"ind_{title_prefix}")
-            
-        target_df["報酬區間(+5日)"] = target_df["+5日報酬(%)"].apply(get_return_tier)
-        tier_order = [
-            "全部區間", "🔥 > +30%", "🚀 +20% ~ +30%", "🟢 +10% ~ +20%",
-            "🌱 0% ~ +10%", "🔻 -10% ~ 0%", "💀 < -10%"
-        ]
-        with col_ret:
-            selected_ret = st.selectbox("選擇 +5 日報酬率區間 (每10%一單位)", tier_order, key=f"ret_{title_prefix}")
-            
-        filtered_df = target_df.copy()
-        if selected_ind != "全部產業":
-            filtered_df = filtered_df[filtered_df["產業別"] == selected_ind]
-        if selected_ret != "全部區間":
-            filtered_df = filtered_df[filtered_df["報酬區間(+5日)"] == selected_ret]
-            
-        st.markdown(f"**符合篩選之標的明細 (共 {len(filtered_df)} 筆，依 +5 日報酬排序)**")
-        st.dataframe(filtered_df.sort_values(by="+5日報酬(%)", ascending=False), use_container_width=True)
-    else:
-        st.success(f"當日共找到 {len(target_df)} 檔標的")
-        all_industries = ["全部產業"] + sorted(list(target_df["產業別"].unique()))
-        selected_ind = st.selectbox("依產業別檢視：", all_industries)
-        show_df = target_df if selected_ind == "全部產業" else target_df[target_df["產業別"] == selected_ind]
-        st.dataframe(show_df, use_container_width=True)
-
-# ----------------- 側邊欄控制項 -----------------
-st.sidebar.header("⚙️ 篩選與策略選擇")
-
-strategy_choice = st.sidebar.radio(
-    "選擇選股模式",
-    [
-        "🔥 1. 投信常規買進 (首買 / 連買3天)",
-        "⚡ 2. 投信 x 布林低基期共振 (主力剛點火)",
-        "💎 3. 投信買超佔成交量高比例 (籌碼鎖定)",
-        "🗜️ 4. 布林通道極致壓縮爆發 (帶量突破)",
-        "📈 5. 布林通道突破上軌 (動能噴出)",
-        "📉 6. 跌破布林下軌 (超跌反彈)",
-        "⚠️ 7. 投信連買轉賣出 (出場避險訊號)"
-    ]
+# -------------------------------------------------------------
+# 0. 頁面基礎設定
+# -------------------------------------------------------------
+st.set_page_config(
+    page_title="台股專屬雙模選股雷達 (全母體旗艦版)",
+    page_icon="🎯",
+    layout="wide"
 )
 
-target_date = st.sidebar.date_input("查詢基準日期", datetime.date.today())
-min_vol = st.sidebar.number_input("最低成交量門檻 (張)", value=300, step=100)
+# -------------------------------------------------------------
+# 1. 官方標準產業代碼對照表
+# -------------------------------------------------------------
+REAL_INDUSTRY_MAP = {
+    "2881": "金融保險業", "2882": "金融保險業", "2886": "金融保險業", "2891": "金融保險業",
+    "2884": "金融保險業", "2885": "金融保險業", "2892": "金融保險業", "2880": "金融保險業",
+    "2883": "金融保險業", "2887": "金融保險業", "2890": "金融保險業", "5880": "金融保險業",
+    "2897": "金融保險業", "2330": "半導體業", "2454": "半導體業", "2303": "半導體業", "3711": "半導體業",
+    "2382": "電腦及週邊設備業", "3231": "電腦及週邊設備業", "2357": "電腦及週邊設備業",
+    "2308": "電子零組件業", "2317": "其他電子業", "3037": "電子零組件業", "2351": "電子工業",
+    "2603": "航運業", "2609": "航運業", "2615": "航運業", "6226": "光電業",
+    "1301": "塑膠工業", "1303": "塑膠工業", "1304": "塑膠工業", "1326": "化學工業",
+    "2409": "光電業", "3481": "光電業", "2313": "電子零組件業", "2449": "半導體業"
+}
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ 風報比設定")
-stop_loss_pct = st.sidebar.slider("停損基準幅度 (%)", min_value=3.0, max_value=15.0, value=10.0, step=0.5)
+BACKUP_STOCK_POOL = [
+    {"代號": "2330", "名稱": "台積電", "產業別": "半導體業", "收盤價": 950.0, "成交量(張)": 35000},
+    {"代號": "2317", "名稱": "鴻海", "產業別": "其他電子業", "收盤價": 180.0, "成交量(張)": 45000},
+    {"代號": "2454", "名稱": "聯發科", "產業別": "半導體業", "收盤價": 1250.0, "成交量(張)": 8000},
+    {"代號": "2351", "名稱": "順德", "產業別": "電子工業", "收盤價": 257.0, "成交量(張)": 13792},
+    {"代號": "6226", "名稱": "光鼎", "產業別": "光電業", "收盤價": 33.0, "成交量(張)": 33484},
+    {"代號": "2897", "名稱": "王道銀行", "產業別": "金融保險業", "收盤價": 11.25, "成交量(張)": 13430},
+    {"代號": "2603", "名稱": "長榮", "產業別": "航運業", "收盤價": 195.0, "成交量(張)": 28000},
+    {"代號": "2609", "名稱": "陽明", "產業別": "航運業", "收盤價": 65.0, "成交量(張)": 35000},
+    {"代號": "2615", "名稱": "萬海", "產業別": "航運業", "收盤價": 88.0, "成交量(張)": 26000},
+    {"代號": "2382", "名稱": "廣達", "產業別": "電腦及週邊設備業", "收盤價": 270.0, "成交量(張)": 21000},
+    {"代號": "3231", "名稱": "緯創", "產業別": "電腦及週邊設備業", "收盤價": 105.0, "成交量(張)": 32000}
+]
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📊 回測模式設定")
-backtest_mode = st.sidebar.radio("選擇回測範圍", ["單季全樣本滾動回測 (約 45~55 交易日)", "僅看當日盤後訊號 (不回測)"])
-is_backtest = backtest_mode.startswith("單季")
+def get_real_industry(code: str) -> str:
+    if code in REAL_INDUSTRY_MAP:
+        return REAL_INDUSTRY_MAP[code]
+    c = int(code) if code.isdigit() else 0
+    if 2800 <= c <= 2899 or 5800 <= c <= 5899:
+        return "金融保險業"
+    elif 2600 <= c <= 2699:
+        return "航運業"
+    elif 1500 <= c <= 1599:
+        return "電機機械業"
+    elif 1300 <= c <= 1399:
+        return "塑膠工業"
+    elif 1700 <= c <= 1799:
+        return "化學工業"
+    elif 2300 <= c <= 2499 or 3000 <= c <= 3799:
+        return "電子工業"
+    return "其他傳產"
 
-# ----------------- 策略執行本體 -----------------
-days_to_pull = 55 if is_backtest else 25
+# -------------------------------------------------------------
+# 2. 策略清單定義 (核心 -> 一般 -> 賣出提醒 -> 特定時刻)
+# -------------------------------------------------------------
+STRATEGY_CATEGORY_MAP = {
+    "🔥 核心順勢交易策略 (正規主升段)": {
+        "布林軌道：突破上軌＋20MA/60MA上翹 (達標出半放中軌/未達標全出)": "core_bollinger_trailing",
+        "投信初認養第1天：20MA>60MA上翹＋站上5MA (達標出半放10MA/未達標全出)": "core_sitc_day1",
+        "投信強勢連買3天以上：20MA>60MA上翹＋站上5MA (達標出半放10MA/未達標全出)": "core_sitc_streak3"
+    },
+    "💡 一般動能與型態策略 (日常補充雷達)": {
+        "量增價揚強勢動能 (Volume Momentum Spike)": "other_vol_momentum",
+        "季線洗盤假跌破：T+5日內強勢站回 ＋ 季線上翹多頭 (MA60 Fake Breakout Reclaim)": "other_ma60_rebound",
+        "波動壓縮後首度爆發 (前5日軌內沉睡＋今日首度帶量穿上軌)": "other_squeeze_breakout"
+    },
+    "🚨 持股賣出提醒雷達 (投信棄養下車)": {
+        "⚠️ 投信由買轉賣第 1 天 (短線鬆動，獲利減碼 50% 提醒)": "exit_sitc_turn_sell",
+        "🚨 投信連續倒貨棄養 (連賣且摜破10MA生命線，全數清倉提醒)": "exit_sitc_dumping"
+    },
+    "🛡️ 崩盤恐慌逆勢抄底專區 (特定時刻用)": {
+        "⚡ 逆布林策略：大盤恐慌崩盤＋跌破下軌收斂轉折 (達5MA出半/直奔中軌全出)": "panic_reverse_bollinger"
+    }
+}
 
-if st.button("🚀 開始執行策略掃描與回測"):
-    df_raw = get_market_history(target_date, days_needed=days_to_pull)
-    if not df_raw.empty:
-        results = []
-        tab1_list, tab2_list = [], []  # 用於首買與連買3天
-        
-        for code, group in df_raw.groupby("code"):
-            group = group.sort_values("date").reset_index(drop=True)
-            n_rows = len(group)
-            if n_rows < (26 if is_backtest else 20):
-                continue
-                
-            close_series = group["close"]
-            vol_series = group["volume"]
-            sitc_series = group["sitc_buy"]
+# -------------------------------------------------------------
+# 3. 抓取 TWSE 活躍股 (開放 max_stocks 動態調整)
+# -------------------------------------------------------------
+@st.cache_data(ttl=1800)
+def fetch_real_twse_pool(min_vol: int = 1000, max_stocks: int = 150):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data"
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code == 200:
+            df_raw = pd.read_csv(io.StringIO(res.text))
+            df_raw.columns = [c.strip().replace('"', '') for c in df_raw.columns]
             
-            # 技術指標預先計算
-            ma20 = close_series.rolling(20).mean()
-            std20 = close_series.rolling(20).std()
-            upper20 = ma20 + (std20 * 2.0)
-            lower20 = ma20 - (std20 * 2.0)
-            bandwidth = (upper20 - lower20) / ma20
-            vol_ma5 = vol_series.rolling(5).mean()
-            vol_ma20 = vol_series.rolling(20).mean()
+            df = pd.DataFrame()
+            df["代號"] = df_raw["證券代號"].astype(str).str.strip().str.replace('"', '')
+            df["名稱"] = df_raw["證券名稱"].astype(str).str.strip().str.replace('"', '')
             
-            max_valid_t = (n_rows - 7) if is_backtest else (n_rows - 1)
-            start_t = 20
-            if max_valid_t < start_t:
-                continue
-                
-            scan_range = range(start_t, max_valid_t + 1) if is_backtest else [n_rows - 1]
+            df = df[df["代號"].str.len() == 4]
+            df = df[df["代號"].str.isdigit()]
+
+            def parse_num(s):
+                try:
+                    return float(str(s).replace(",", "").replace('"', '').strip())
+                except:
+                    return 0.0
+
+            df["收盤價"] = df_raw["收盤價"].apply(parse_num)
+            df["成交量(張)"] = df_raw["成交股數"].apply(parse_num) // 1000
             
-            for t_idx in scan_range:
-                t_vol = vol_series.iloc[t_idx]
-                if t_vol < min_vol:
-                    continue
+            df = df[(df["收盤價"] > 10.0) & (df["成交量(張)"] >= min_vol)].copy()
+            df["產業別"] = df["代號"].apply(get_real_industry)
+            if not df.empty:
+                return df.sort_values(by="成交量(張)", ascending=False).head(max_stocks)
+    except Exception:
+        pass
+    return pd.DataFrame(BACKUP_STOCK_POOL)
+
+# -------------------------------------------------------------
+# 4. yfinance 抓取歷史 K 線
+# -------------------------------------------------------------
+@st.cache_data(ttl=1800)
+def fetch_historical_ohlc_data(code_list: list):
+    if not code_list:
+        return {}
+
+    k_dict = {}
+    for c in code_list:
+        try:
+            ticker = f"{c}.TW"
+            sub = yf.download(ticker, period="1y", interval="1d", auto_adjust=True, progress=False, threads=False)
+            if not sub.empty and len(sub) >= 65:
+                if isinstance(sub.columns, pd.MultiIndex):
+                    sub = sub.xs(ticker, level=1, axis=1)
+                sub.index = pd.to_datetime(sub.index).strftime("%Y-%m-%d")
+                k_dict[c] = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception:
+            continue
+    return k_dict
+
+# -------------------------------------------------------------
+# 5. 基準日訊號運算
+# -------------------------------------------------------------
+def get_signals_by_date(df_pool: pd.DataFrame, k_dict: dict, strategy_key: str, target_rr: float, base_date_str: str):
+    signals = []
+    for _, row in df_pool.iterrows():
+        code = row["代號"]
+        if code not in k_dict:
+            continue
+        df_k = k_dict[code]
+
+        sub_k = df_k.loc[df_k.index <= base_date_str]
+        if len(sub_k) < 65:
+            continue
+
+        try:
+            close = float(sub_k["Close"].iloc[-1])
+            high = float(sub_k["High"].iloc[-1])
+            low = float(sub_k["Low"].iloc[-1])
+            prev_close = float(sub_k["Close"].iloc[-2])
+            vol = float(sub_k["Volume"].iloc[-1])
+            vol_prev = float(sub_k["Volume"].iloc[-2])
+            actual_date = str(sub_k.index[-1])
+
+            s_close = sub_k["Close"]
+            ma5 = float(s_close.tail(5).mean())
+            ma10 = float(s_close.tail(10).mean())
+            ma20 = float(s_close.tail(20).mean())
+            ma20_prev = float(s_close.iloc[-21:-1].mean())
+            
+            ma60 = float(s_close.tail(60).mean())
+            ma60_prev = float(s_close.iloc[-61:-1].mean())
+            ma60_up = ma60 > ma60_prev
+
+            std20 = float(s_close.tail(20).std())
+            bb_upper = ma20 + (2.0 * std20)
+            bb_mid = ma20
+            bb_lower = ma20 - (2.0 * std20)
+
+            ma20_up = ma20 > ma20_prev
+            trend_ok = (ma20 > ma60) and ma20_up
+
+            item = {
+                "代號": code,
+                "名稱": row["名稱"],
+                "產業別": row["產業別"],
+                "基準日": actual_date,
+                "收盤價": round(close, 2),
+                "成交量(張)": int(row["成交量(張)"]),
+                "5MA": round(ma5, 2),
+                "10MA": round(ma10, 2),
+                "20MA": round(ma20, 2),
+                "60MA": round(ma60, 2),
+                "布林上軌": round(bb_upper, 2),
+                "布林中軌": round(bb_mid, 2),
+                "布林下軌": round(bb_lower, 2),
+                "20MA趨勢": "▲ 多頭上翹" if ma20_up else "▼ 下彎",
+                "60MA趨勢": "▲ 多頭上翹" if ma60_up else "▼ 下彎"
+            }
+
+            triggered = False
+
+            if strategy_key == "core_bollinger_trailing":
+                if trend_ok and (close >= bb_upper * 0.985):
+                    item["風報比"] = round((close - bb_mid) / max(close * 0.035, 0.4), 2)
+                    item["進場狀態"] = "🔥 突破上軌且均線多頭上翹"
+                    item["出場指引"] = f"跌破上軌({round(bb_upper,2)})：達標出50%，破中軌({round(bb_mid,2)})全出；未達標全出"
+                    triggered = True
+
+            elif strategy_key in ["core_sitc_day1", "core_sitc_streak3"]:
+                if trend_ok and (close >= ma5):
+                    item["風報比"] = round((close - ma10) / max(close * 0.03, 0.3), 2)
+                    item["進場狀態"] = "🔥 站上5MA且20MA>60MA上翹"
+                    item["出場指引"] = f"達標風報比({target_rr}R)出50%，剩餘整根完全跌破10MA({round(ma10,2)})全數清空"
+                    triggered = True
+
+            elif strategy_key == "other_vol_momentum":
+                if close > prev_close and close > ma5:
+                    item["風報比"] = round((close - ma5) / max(close * 0.025, 0.3), 2)
+                    item["進場狀態"] = "⚡ 量價齊揚突破 5MA 短線動能"
+                    item["出場指引"] = f"跌破 5MA ({round(ma5,2)}) 短線平倉"
+                    triggered = True
+
+            elif strategy_key == "other_ma60_rebound":
+                if (close >= ma60) and ma60_up:
+                    recent_broke = False
+                    days_under = 0
+                    for d in range(2, 7):
+                        past_c = float(s_close.iloc[-d])
+                        past_ma60 = float(s_close.iloc[-d-60:-d].mean()) if len(s_close) >= (d+60) else ma60
+                        if past_c < past_ma60:
+                            recent_broke = True
+                            days_under = d - 1
+                            break
                     
-                c = close_series.iloc[t_idx]
-                t_sitc = sitc_series.iloc[t_idx]
-                name = group["name"].iloc[t_idx]
-                sig_date = str(group["date"].iloc[t_idx])
-                
-                # ----------------- 7 大策略條件判定 -----------------
-                match = False
-                sub_type = ""
-                
-                if "1. 投信常規買進" in strategy_choice:
-                    t1, t2, t3 = sitc_series.iloc[t_idx - 1], sitc_series.iloc[t_idx - 2], sitc_series.iloc[t_idx - 3]
-                    is_first = (t_sitc >= 100) and (max(t1, t2, t3) <= 10)
-                    is_c3 = (t_sitc >= 80) and (t1 >= 80) and (t2 >= 80) and (t3 <= 30)
-                    if is_first:
-                        match, sub_type = True, "🔥 首日買進"
-                    elif is_c3:
-                        match, sub_type = True, "🚀 連買 3 天"
-                        
-                elif "2. 投信 x 布林低基期共振" in strategy_choice:
-                    # 投信買超 > 80張 + 站穩中軌(MA20)且離中軌不超過3% + 成交量大於5日均量
-                    near_ma20 = (c >= ma20.iloc[t_idx]) and (c <= ma20.iloc[t_idx] * 1.03)
-                    vol_up = t_vol >= vol_ma5.iloc[t_idx]
-                    if (t_sitc >= 80) and near_ma20 and vol_up:
-                        match = True
-                        
-                elif "3. 投信買超佔成交量高比例" in strategy_choice:
-                    # 當日投信買超佔成交量 10% 以上 (法人全力吃貨)
-                    sitc_vol_ratio = (t_sitc / t_vol) * 100 if t_vol > 0 else 0
-                    if (t_sitc >= 150) and (sitc_vol_ratio >= 10.0):
-                        match = True
-                        
-                elif "4. 布林通道極致壓縮爆發" in strategy_choice:
-                    # 過去5天頻寬平均 < 10%，今日帶量突破上軌且量大於20日均量 1.5 倍
-                    is_squeeze = bandwidth.iloc[t_idx - 5 : t_idx].mean() < 0.12
-                    break_up = c >= upper20.iloc[t_idx] * 0.995
-                    vol_blast = t_vol >= vol_ma20.iloc[t_idx] * 1.5
-                    if is_squeeze and break_up and vol_blast:
-                        match = True
-                        
-                elif "5. 布林通道突破上軌" in strategy_choice:
-                    if c >= upper20.iloc[t_idx] * 0.995:
-                        match = True
-                        
-                elif "6. 跌破布林下軌" in strategy_choice:
-                    if c <= lower20.iloc[t_idx] * 1.005:
-                        match = True
-                        
-                elif "7. 投信連買轉賣出" in strategy_choice:
-                    # 前3天投信天天買超 > 50張，今日首度賣超 > 100張 (出場避險)
-                    t1, t2, t3 = sitc_series.iloc[t_idx - 1], sitc_series.iloc[t_idx - 2], sitc_series.iloc[t_idx - 3]
-                    prior_buying = (t1 >= 50) and (t2 >= 50) and (t3 >= 50)
-                    turn_to_sell = t_sitc <= -100
-                    if prior_buying and turn_to_sell:
-                        match = True
+                    if recent_broke:
+                        item["風報比"] = round((close - ma60) / max(close * 0.03, 0.4), 2)
+                        item["進場狀態"] = f"🌱 季線洗盤成立！T+{days_under} 日站回季線，季線上翹多頭不變"
+                        item["出場指引"] = f"收盤再度跌破季線 60MA ({round(ma60,2)}) 停損；達標出 50%"
+                        triggered = True
 
-                # ----------------- 封裝資料與回測 -----------------
-                if match:
-                    sl_p, tp3_p, tp5_p = calc_rr_targets(c, stop_loss_pct)
-                    item = {
-                        "代號": str(code), "名稱": name, "訊號日(T)": sig_date,
-                        "基準收盤": c,
-                        f"停損(-{stop_loss_pct}%)": sl_p,
-                        f"1:3停利(+{stop_loss_pct*3}%)": tp3_p,
-                        f"1:5停利(+{stop_loss_pct*5}%)": tp5_p,
-                        "T日投信買賣超(張)": int(t_sitc),
-                        "成交量": int(t_vol)
-                    }
-                    if is_backtest:
-                        entry_p = close_series.iloc[t_idx + 1]
-                        item["進場日(T+1)"] = str(group["date"].iloc[t_idx + 1])
-                        item["進場價"] = entry_p
-                        for d in range(1, 6):
-                            day_close = close_series.iloc[t_idx + 1 + d]
-                            ret = ((day_close - entry_p) / entry_p) * 100
-                            item[f"+{d}日報酬(%)"] = round(ret, 2)
-                            
-                    if "1. 投信常規買進" in strategy_choice:
-                        if sub_type == "🔥 首日買進":
-                            tab1_list.append(item)
-                        else:
-                            tab2_list.append(item)
-                    else:
-                        results.append(item)
+            elif strategy_key == "other_squeeze_breakout":
+                today_break = close >= bb_upper
+                stayed_inside_5days = True
+                for d in range(2, 7):
+                    c_d = float(s_close.iloc[-d])
+                    ma20_d = float(s_close.iloc[-d-20:-d].mean())
+                    std20_d = float(s_close.iloc[-d-20:-d].std())
+                    upper_d = ma20_d + (2.0 * std20_d)
+                    if c_d >= upper_d:
+                        stayed_inside_5days = False
+                        break
+                
+                s_prev = s_close.iloc[:-1]
+                ma20_y = float(s_prev.tail(20).mean())
+                std20_y = float(s_prev.tail(20).std())
+                bw_y = (4.0 * std20_y) / ma20_y if ma20_y > 0 else 1.0
+                is_squeeze = bw_y <= 0.10
+                vol_up = vol >= vol_prev * 1.25
 
-        # ----------------- 結果呈現 -----------------
-        if "1. 投信常規買進" in strategy_choice:
-            tab1, tab2 = st.tabs(["🔥 首日買進分析", "🚀 連買 3 天分析"])
-            with tab1:
-                render_backtest_with_filters(pd.DataFrame(tab1_list), "首日買進", is_backtest)
-            with tab2:
-                render_backtest_with_filters(pd.DataFrame(tab2_list), "連續買進 3 天", is_backtest)
+                if today_break and stayed_inside_5days and is_squeeze and vol_up:
+                    item["風報比"] = round((close - ma20) / max(close * 0.035, 0.4), 2)
+                    item["進場狀態"] = "💥 前5日極度壓縮沉睡，今日首度帶量穿透上軌表態！"
+                    item["出場指引"] = f"跌破 20MA ({round(ma20,2)}) 全數出場"
+                    triggered = True
+
+            elif strategy_key == "exit_sitc_turn_sell":
+                if close < prev_close and close < ma5 and close >= ma10:
+                    item["警戒等級"] = "⚠️ 短線鬆動 (由買轉賣首日)"
+                    item["操作建議"] = f"建議【先出 50% 鎖利】，剩餘嚴設 10MA ({round(ma10,2)}) 防守"
+                    triggered = True
+
+            elif strategy_key == "exit_sitc_dumping":
+                if high < ma10 or close < ma10:
+                    item["警戒等級"] = "🚨 棄養倒貨 (跌破生命線)"
+                    item["操作建議"] = f"跌破 10MA ({round(ma10,2)})！請【全數清倉出場】"
+                    triggered = True
+
+            elif strategy_key == "panic_reverse_bollinger":
+                if (low <= bb_lower) and (close >= prev_close):
+                    item["風報比"] = round(max(bb_mid - close, 0.5) / max(close - low, close * 0.035), 2)
+                    item["進場狀態"] = "🚨 逆布林：殺穿下軌止跌收斂"
+                    item["出場指引"] = f"反彈越過5MA出50%，直奔中軌({round(bb_mid,2)})全出；破當日低點停損"
+                    triggered = True
+
+            if triggered:
+                signals.append(item)
+        except Exception:
+            continue
+
+    return pd.DataFrame(signals)
+
+# -------------------------------------------------------------
+# 6. 歷史回測引擎
+# -------------------------------------------------------------
+def run_real_historical_backtest(k_dict: dict, df_pool: pd.DataFrame, strategy_key: str, target_rr: float, backtest_len: int = 60, base_date_str: str = ""):
+    trades = []
+    
+    for _, row in df_pool.iterrows():
+        code = row["代號"]
+        if code not in k_dict:
+            continue
+        df_k = k_dict[code]
+        
+        sub_k = df_k.loc[df_k.index <= base_date_str]
+        if len(sub_k) < (backtest_len + 65):
+            continue
+        
+        eval_k = sub_k.iloc[-backtest_len:]
+        
+        in_trade = False
+        entry_price = 0.0
+        entry_date = ""
+        stop_loss_price = 0.0
+        half_exited = False
+        first_exit_date = "-"
+        first_exit_price = "-"
+        first_exit_ret = 0.0
+
+        for i in range(5, len(eval_k)):
+            dt = str(eval_k.index[i])
+            cur_slice = sub_k.loc[:eval_k.index[i]]
+            
+            try:
+                close = float(cur_slice["Close"].iloc[-1])
+                high = float(cur_slice["High"].iloc[-1])
+                low = float(cur_slice["Low"].iloc[-1])
+                prev_c = float(cur_slice["Close"].iloc[-2])
+                vol = float(cur_slice["Volume"].iloc[-1])
+                vol_prev = float(cur_slice["Volume"].iloc[-2])
+                s_c = cur_slice["Close"]
+
+                ma5 = float(s_c.tail(5).mean())
+                ma10 = float(s_c.tail(10).mean())
+                ma20 = float(s_c.tail(20).mean())
+                ma20_prev = float(s_c.iloc[-21:-1].mean())
+                ma60 = float(s_c.tail(60).mean())
+                ma60_prev = float(s_c.iloc[-61:-1].mean())
+                ma60_up = ma60 > ma60_prev
+
+                std20 = float(s_c.tail(20).std())
+                bb_upper = ma20 + (2.0 * std20)
+                bb_mid = ma20
+                bb_lower = ma20 - (2.0 * std20)
+
+                trend_ok = (ma20 > ma60) and (ma20 > ma20_prev)
+
+                if not in_trade:
+                    buy_sig = False
+                    if strategy_key == "core_bollinger_trailing":
+                        buy_sig = trend_ok and (close >= bb_upper * 0.985)
+                    elif strategy_key in ["core_sitc_day1", "core_sitc_streak3", "exit_sitc_turn_sell", "exit_sitc_dumping"]:
+                        buy_sig = trend_ok and (close >= ma5)
+                    elif strategy_key == "panic_reverse_bollinger":
+                        buy_sig = (low <= bb_lower) and (close >= prev_c)
+                    elif strategy_key == "other_vol_momentum":
+                        buy_sig = (close > prev_c) and (close > ma5)
+                    
+                    elif strategy_key == "other_ma60_rebound":
+                        if (close >= ma60) and ma60_up:
+                            recent_broke = False
+                            for d in range(2, 7):
+                                past_c = float(s_c.iloc[-d])
+                                past_ma60 = float(s_c.iloc[-d-60:-d].mean())
+                                if past_c < past_ma60:
+                                    recent_broke = True
+                                    break
+                            buy_sig = recent_broke
+
+                    elif strategy_key == "other_squeeze_breakout":
+                        today_break = close >= bb_upper
+                        stayed_inside_5days = True
+                        for d in range(2, 7):
+                            c_d = float(s_c.iloc[-d])
+                            ma20_d = float(s_c.iloc[-d-20:-d].mean())
+                            std20_d = float(s_c.iloc[-d-20:-d].std())
+                            if c_d >= (ma20_d + 2.0 * std20_d):
+                                stayed_inside_5days = False
+                                break
+                        s_prev_c = s_c.iloc[:-1]
+                        bw_y = (4.0 * float(s_prev_c.tail(20).std())) / float(s_prev_c.tail(20).mean())
+                        buy_sig = today_break and stayed_inside_5days and (bw_y <= 0.10) and (vol >= vol_prev * 1.25)
+
+                    if buy_sig:
+                        in_trade = True
+                        entry_price = close
+                        entry_date = dt
+                        stop_loss_price = low if strategy_key == "panic_reverse_bollinger" else 0.0
+                        half_exited = False
+                        first_exit_date = "-"
+                        first_exit_price = "-"
+                        first_exit_ret = 0.0
+
+                else:
+                    cur_ret = (close - entry_price) / entry_price
+                    
+                    if strategy_key == "core_bollinger_trailing":
+                        if close < bb_upper:
+                            rr = cur_ret / 0.035
+                            if rr >= target_rr and not half_exited:
+                                half_exited = True
+                                first_exit_date = dt
+                                first_exit_price = f"{close:.2f}"
+                                first_exit_ret = cur_ret * 100
+                            elif not half_exited:
+                                total_ret = cur_ret * 100
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "未達風報比跌破上軌全出"
+                                })
+                                in_trade = False
+
+                        if in_trade and half_exited and (close <= bb_mid):
+                            second_exit_ret = cur_ret * 100
+                            final_total_ret = 0.5 * first_exit_ret + 0.5 * second_exit_ret
+                            trades.append({
+                                "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                "第1次出場日": first_exit_date, "第1次出場價": first_exit_price, "全數出場日": dt, "全數出場價": round(close, 2),
+                                "總報酬率(%)": round(final_total_ret, 2), "勝負": "勝" if final_total_ret > 0 else "敗", "出場型態": "達標出50%後，破中軌(20MA)全出"
+                            })
+                            in_trade = False
+
+                    elif strategy_key in ["core_sitc_day1", "core_sitc_streak3", "exit_sitc_turn_sell", "exit_sitc_dumping"]:
+                        rr = cur_ret / 0.03
+                        if rr >= target_rr and not half_exited and (close < ma5 or close < prev_c):
+                            half_exited = True
+                            first_exit_date = dt
+                            first_exit_price = f"{close:.2f}"
+                            first_exit_ret = cur_ret * 100
+
+                        if high < ma10 and close < ma10:
+                            if half_exited:
+                                second_exit_ret = cur_ret * 100
+                                final_total_ret = 0.5 * first_exit_ret + 0.5 * second_exit_ret
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": first_exit_date, "第1次出場價": first_exit_price, "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(final_total_ret, 2), "勝負": "勝" if final_total_ret > 0 else "敗", "出場型態": "達標出50%後，完全跌破10MA全出"
+                                })
+                            else:
+                                total_ret = cur_ret * 100
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "未達標完全跌破10MA全數停損"
+                                })
+                            in_trade = False
+
+                    elif strategy_key == "other_ma60_rebound":
+                        rr = cur_ret / 0.035
+                        if rr >= target_rr and not half_exited:
+                            half_exited = True
+                            first_exit_date = dt
+                            first_exit_price = f"{close:.2f}"
+                            first_exit_ret = cur_ret * 100
+
+                        if close < ma60:
+                            if half_exited:
+                                second_exit_ret = cur_ret * 100
+                                final_total_ret = 0.5 * first_exit_ret + 0.5 * second_exit_ret
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": first_exit_date, "第1次出場價": first_exit_price, "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(final_total_ret, 2), "勝負": "勝" if final_total_ret > 0 else "敗", "出場型態": "達標出50%後，再破季線全出"
+                                })
+                            else:
+                                total_ret = cur_ret * 100
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "跌破季線(60MA)停損"
+                                })
+                            in_trade = False
+
+                    elif strategy_key == "panic_reverse_bollinger":
+                        if close >= ma5 and not half_exited:
+                            half_exited = True
+                            first_exit_date = dt
+                            first_exit_price = f"{close:.2f}"
+                            first_exit_ret = cur_ret * 100
+
+                        reached_mid = close >= bb_mid
+                        stop_hit = close < stop_loss_price
+
+                        if reached_mid or stop_hit:
+                            if half_exited:
+                                second_exit_ret = cur_ret * 100
+                                final_total_ret = 0.5 * first_exit_ret + 0.5 * second_exit_ret
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": first_exit_date, "第1次出場價": first_exit_price, "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(final_total_ret, 2), "勝負": "勝" if final_total_ret > 0 else "敗", "出場型態": "達中軌(20MA)全出" if reached_mid else "破低點停損"
+                                })
+                            else:
+                                total_ret = cur_ret * 100
+                                trades.append({
+                                    "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                    "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                    "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "直奔中軌全出" if reached_mid else "破低點停損"
+                                })
+                            in_trade = False
+
+                    elif strategy_key == "other_vol_momentum":
+                        if close < ma5:
+                            total_ret = cur_ret * 100
+                            trades.append({
+                                "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "跌破5MA短線停利"
+                            })
+                            in_trade = False
+
+                    elif strategy_key == "other_squeeze_breakout":
+                        if close < ma20:
+                            total_ret = cur_ret * 100
+                            trades.append({
+                                "代號": code, "名稱": row["名稱"], "進場日": entry_date, "進場價": round(entry_price, 2),
+                                "第1次出場日": dt, "第1次出場價": f"{close:.2f}", "全數出場日": dt, "全數出場價": round(close, 2),
+                                "總報酬率(%)": round(total_ret, 2), "勝負": "勝" if total_ret > 0 else "敗", "出場型態": "跌破20MA月線出場"
+                            })
+                            in_trade = False
+            except Exception:
+                continue
+
+    return pd.DataFrame(trades)
+
+# -------------------------------------------------------------
+# 7. 主程式入口
+# -------------------------------------------------------------
+def main():
+    with st.sidebar:
+        st.header("📅 查詢基準日設定")
+        selected_date = st.date_input(
+            "選擇查詢基準日 (As of Date)",
+            value=datetime.date.today(),
+            max_value=datetime.date.today()
+        )
+        base_date_str = selected_date.strftime("%Y-%m-%d")
+        st.info(f"當前雷達基準日：`{base_date_str}`")
+
+        st.markdown("---")
+        st.header("🎯 策略專區切換")
+        selected_category = st.radio("選擇策略專區", list(STRATEGY_CATEGORY_MAP.keys()), index=0)
+        strategy_options = STRATEGY_CATEGORY_MAP[selected_category]
+        selected_strategy_label = st.selectbox("選擇觸發策略", list(strategy_options.keys()))
+        strategy_code = strategy_options[selected_strategy_label]
+
+        st.markdown("---")
+        st.header("⚙️ 參數設定")
+        max_stocks = st.slider("🔍 監控母體數量上限 (檔)", min_value=50, max_value=300, value=150, step=25)
+        backtest_days = st.slider("歷史回測天數 (天)", min_value=45, max_value=60, value=60, step=5)
+        
+        if strategy_code in ["core_bollinger_trailing", "core_sitc_day1", "core_sitc_streak3", "other_ma60_rebound"]:
+            target_rr = st.slider("第一階段停利目標風報比 (R:R)", 1.0, 3.0, 1.5, 0.1)
         else:
-            render_backtest_with_filters(pd.DataFrame(results), strategy_choice, is_backtest)
+            target_rr = 1.5
+            
+        min_vol = st.slider("最低成交量門檻 (張)", 800, 5000, 1500, 300)
+
+    st.title("🎯 台股專屬雙模選股雷達 (全功能旗艦版)")
+    st.caption("支援【核心順勢 ＋ 季線洗盤站回 ＋ 賣出提醒 ＋ 逆布林抄底】")
+
+    with st.spinner(f"載入台股前 {max_stocks} 大活躍股數據中..."):
+        df_pool = fetch_real_twse_pool(min_vol, max_stocks)
+        pool_codes = df_pool["代號"].tolist() if not df_pool.empty else []
+        k_dict = fetch_historical_ohlc_data(pool_codes)
+
+    is_exit_radar = "exit_sitc" in strategy_code
+
+    tab_signals, tab_backtest = st.tabs([
+        f"🚨 基準日賣出提醒 ({base_date_str})" if is_exit_radar else f"📡 基準日實時訊號 ({base_date_str})", 
+        f"📈 基準日前推 {backtest_days} 天驗證紀錄"
+    ])
+
+    with tab_signals:
+        df_today = get_signals_by_date(df_pool, k_dict, strategy_code, target_rr, base_date_str)
+        
+        c1, c2 = st.columns(2)
+        c1.metric("提醒警戒檔數" if is_exit_radar else "基準日觸發標的", f"{len(df_today)} 檔")
+        c2.metric("監控母體庫存池", f"{len(df_pool)} 檔")
+
+        if is_exit_radar:
+            st.warning("⚠️ **【持股賣出提醒專區】**：此處標的為投信籌碼鬆動或棄養倒貨之警戒股。若持有此類股票，請嚴格依建議指引分批停利或清倉！")
+            if not df_today.empty:
+                disp_cols = ["代號", "名稱", "產業別", "基準日", "收盤價", "5MA", "10MA", "警戒等級", "操作建議", "成交量(張)"]
+                st.dataframe(
+                    df_today[disp_cols].style.format({
+                        "收盤價": "{:.2f}",
+                        "5MA": "{:.2f}",
+                        "10MA": "{:.2f}",
+                        "成交量(張)": "{:,}"
+                    }),
+                    width="stretch,
+                    hide_index=True
+                )
+            else:
+                st.success("✅ 今日監控池中無投信大幅倒貨或破線之持股，持股整體穩定！")
+        else:
+            st.markdown(f"#### 🎯 `{base_date_str}` 符合【{selected_strategy_label}】標的")
+            if not df_today.empty:
+                disp_cols = ["代號", "名稱", "產業別", "基準日", "收盤價", "20MA", "60MA", "60MA趨勢", "風報比", "進場狀態", "出場指引", "成交量(張)"]
+                st.dataframe(
+                    df_today[disp_cols].style.format({
+                        "收盤價": "{:.2f}",
+                        "20MA": "{:.2f}",
+                        "60MA": "{:.2f}",
+                        "風報比": "{:.2f}",
+                        "成交量(張)": "{:,}"
+                    }),
+                    width="stretch,
+                    hide_index=True
+                )
+            else:
+                st.info(f"💡 `{base_date_str}` 無標的滿足條件，嚴守紀律！")
+
+    with tab_backtest:
+        df_bt = run_real_historical_backtest(k_dict, df_pool, strategy_code, target_rr, backtest_days, base_date_str)
+        
+        if not df_bt.empty:
+            win_count = len(df_bt[df_bt["勝負"] == "勝"])
+            win_rate = (win_count / len(df_bt)) * 100
+            avg_ret = df_bt["總報酬率(%)"].mean()
+            profit_trades = df_bt[df_bt["總報酬率(%)"] > 0]["總報酬率(%)"].mean() if win_count > 0 else 0
+            loss_trades = abs(df_bt[df_bt["總報酬率(%)"] < 0]["總報酬率(%)"].mean()) if (len(df_bt) - win_count) > 0 else 1
+            rr_ratio = profit_trades / loss_trades if loss_trades > 0 else 0.0
+
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric(f"近{backtest_days}天交易次數", f"{len(df_bt)} 筆")
+            b2.metric("真實歷史勝率", f"{win_rate:.1f}%")
+            b3.metric("單筆平均報酬", f"{avg_ret:+.2f}%")
+            b4.metric("歷史實際風報比", f"{rr_ratio:.2f}")
+
+            st.markdown(f"#### 📋 截至 `{base_date_str}` 前推 {backtest_days} 天逐筆進出紀錄 (兩階段出場完整呈現)")
+            
+            display_bt = df_bt.sort_values(by="進場日", ascending=False).copy()
+            st.dataframe(
+                display_bt.style.format({
+                    "進場價": "{:.2f}",
+                    "全數出場價": "{:.2f}",
+                    "總報酬率(%)": "{:+.2f}%"
+                }),
+                width="stretch,
+                hide_index=True
+            )
+        else:
+            st.warning(f"截至 `{base_date_str}` 前推 {backtest_days} 天內無觸發完成交易之樣本。")
+
+if __name__ == "__main__":
+    main()
