@@ -10,7 +10,7 @@ import yfinance as yf
 # 0. 頁面基礎設定
 # -------------------------------------------------------------
 st.set_page_config(
-    page_title="台股專屬雙模選股雷達 (全母體旗艦版)",
+    page_title="台股專屬雙模選股雷達 (全功能旗艦版)",
     page_icon="🎯",
     layout="wide"
 )
@@ -86,7 +86,7 @@ STRATEGY_CATEGORY_MAP = {
 }
 
 # -------------------------------------------------------------
-# 3. 抓取 TWSE 活躍股 (開放 max_stocks 動態調整)
+# 3. 抓取 TWSE 活躍股
 # -------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_real_twse_pool(min_vol: int = 1000, max_stocks: int = 150):
@@ -597,7 +597,7 @@ def main():
                         "10MA": "{:.2f}",
                         "成交量(張)": "{:,}"
                     }),
-                    width="stretch,
+                    use_container_width=True,
                     hide_index=True
                 )
             else:
@@ -614,7 +614,7 @@ def main():
                         "風報比": "{:.2f}",
                         "成交量(張)": "{:,}"
                     }),
-                    width="stretch,
+                    use_container_width=True,
                     hide_index=True
                 )
             else:
@@ -646,7 +646,7 @@ def main():
                     "全數出場價": "{:.2f}",
                     "總報酬率(%)": "{:+.2f}%"
                 }),
-                width="stretch,
+                use_container_width=True,
                 hide_index=True
             )
         else:
